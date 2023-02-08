@@ -17,9 +17,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/sensor.h>
 
-#if DT_ANY_INST_ON_BUS_STATUS_OKAY(spi)
-#include <zephyr/drivers/spi.h>
-#elif DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
+#if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
 #include <zephyr/drivers/i2c.h>
 #endif
 
@@ -29,35 +27,39 @@ LOG_MODULE_REGISTER(LIS2HH12, CONFIG_SENSOR_LOG_LEVEL);
 
 /**
  * lis2hh12_set_range - set full scale range for acc
- * @dev: Pointer to instance of struct device (I2C or SPI)
- * @range: Full scale range (2, 4, 8 and 16 G)
+ * @dev: Pointer to instance of struct device
+ * @fs: Full scale range (2, 4, 8 and 16 G)
  */
 static int lis2hh12_set_range(const struct device *dev, uint8_t fs)
 {
 	int err;
-	struct lis2hh12_data *lis2hh12 = dev->data;
 	const struct lis2hh12_device_config *cfg = dev->config;
 	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-	uint8_t shift_gain = 0U;
 
-	err = lis2hh12_full_scale_set(ctx, fs);
+	lis2hh12_xl_fs_t val;
+	switch (fs) {
+	case 2:
+		val = LIS2HH12_2g;
+		break;
+	case 4:
+		val = LIS2HH12_4g;
+		break;
+	case 8:
+		val = LIS2HH12_8g;
+		break;
 
-	if (cfg->pm == LIS2HH12_CONT_LOW_PWR_12bit) {
-		shift_gain = LIS2HH12_SHFT_GAIN_NOLP1;
+	default:
+		LOG_ERR("%s: bad range %d", dev->name, fs);
+		return -ENOTSUP;
 	}
 
-	if (!err) {
-		/* save internally gain for optimization */
-		lis2hh12->gain =
-			LIS2HH12_FS_TO_GAIN(fs, shift_gain);
-	}
-
+	err = lis2hh12_xl_full_scale_set(ctx, val);
 	return err;
 }
 
 /**
  * lis2hh12_set_odr - set new sampling frequency
- * @dev: Pointer to instance of struct device (I2C or SPI)
+ * @dev: Pointer to instance of struct device
  * @odr: Output data rate
  */
 static int lis2hh12_set_odr(const struct device *dev, uint16_t odr)
@@ -65,20 +67,39 @@ static int lis2hh12_set_odr(const struct device *dev, uint16_t odr)
 	const struct lis2hh12_device_config *cfg = dev->config;
 	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
 	struct lis2hh12_data *lis2hh12 = dev->data;
-	uint8_t val;
+	lis2hh12_xl_data_rate_t val;
 
-	/* check if power off */
-	if (odr == 0U) {
-		return lis2hh12_data_rate_set(ctx, LIS2HH12_XL_ODR_OFF);
-	}
+	switch (odr) {
+	case 0:
+		val = LIS2HH12_XL_ODR_OFF;
+		break;
+	case 10:
+		val = LIS2HH12_XL_ODR_10Hz;
+		break;
+	case 50:
+		val = LIS2HH12_XL_ODR_50Hz;
+		break;
+	case 100:
+		val = LIS2HH12_XL_ODR_100Hz;
+		break;
+	case 200:
+		val = LIS2HH12_XL_ODR_200Hz;
+		break;
+	case 400:
+		val = LIS2HH12_XL_ODR_400Hz;
+		break;
+	case 800:
+		val = LIS2HH12_XL_ODR_800Hz;
+		break;
 
-	val =  LIS2HH12_ODR_TO_REG(odr);
-	if (val > LIS2HH12_XL_ODR_1k6Hz) {
-		LOG_ERR("ODR too high");
+	default:
+		LOG_ERR("%s: bad odr %d", dev->name, odr);
 		return -ENOTSUP;
 	}
+
+
 	lis2hh12->odr = odr;
-	return lis2hh12_data_rate_set(ctx, val);
+	return lis2hh12_xl_data_rate_set(ctx, val);
 }
 
 static inline void lis2hh12_convert(struct sensor_value *val, int raw_val,
@@ -147,8 +168,7 @@ static int lis2hh12_config(const struct device *dev, enum sensor_channel chan,
 {
 	switch (attr) {
 	case SENSOR_ATTR_FULL_SCALE:
-		return lis2hh12_set_range(dev,
-				LIS2HH12_FS_TO_REG(sensor_ms2_to_g(val)));
+		return lis2hh12_set_range(dev,sensor_ms2_to_g(val));
 	case SENSOR_ATTR_SAMPLING_FREQUENCY:
 		return lis2hh12_set_odr(dev, val->val1);
 	default:
@@ -171,131 +191,11 @@ static inline int32_t sensor_ms2_to_mg(const struct sensor_value *ms2)
 	}
 }
 
-#if CONFIG_LIS2HH12_THRESHOLD
-
-/* Converts a lis2hh12_fs_t range to its value in milli-g
- * Range can be 2/4/8/16G
- */
-#define FS_RANGE_TO_MG(fs_range)	((2U << fs_range) * 1000U)
-
-/* Converts a range in mg to the lsb value for the WK_THS register
- * For the reg value: 1 LSB = 1/64 of FS
- * Range can be 2/4/8/16G
- */
-#define MG_TO_WK_THS_LSB(range_mg)	(range_mg / 64)
-
-/* Calculates the WK_THS reg value
- * from the threshold in mg and the lsb value in mg
- * with correct integer rounding
- */
-#define THRESHOLD_MG_TO_WK_THS_REG(thr_mg, lsb_mg) \
-	((thr_mg + (lsb_mg / 2)) / lsb_mg)
-
-static int lis2hh12_attr_set_thresh(const struct device *dev,
-					enum sensor_channel chan,
-					enum sensor_attribute attr,
-					const struct sensor_value *val)
-{
-	uint8_t reg;
-	size_t ret;
-	int lsb_mg;
-	const struct lis2hh12_device_config *cfg = dev->config;
-	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-
-	LOG_DBG("%s on channel %d", __func__, chan);
-
-	/* can only be set for all directions at once */
-	if (chan != SENSOR_CHAN_ACCEL_XYZ) {
-		return -EINVAL;
-	}
-
-	/* Configure wakeup threshold threshold. */
-	lis2hh12_fs_t range;
-	int err = lis2hh12_full_scale_get(ctx, &range);
-
-	if (err) {
-		return err;
-	}
-
-	uint32_t thr_mg = abs(sensor_ms2_to_mg(val));
-
-	/* Check maximum value: depends on current FS value */
-	if (thr_mg >= FS_RANGE_TO_MG(range)) {
-		return -EINVAL;
-	}
-
-	/* The threshold is applied to both positive and negative data:
-	 * for a wake-up interrupt generation at least one of the three axes must be
-	 * bigger than the threshold.
-	 */
-	lsb_mg = MG_TO_WK_THS_LSB(FS_RANGE_TO_MG(range));
-	reg = THRESHOLD_MG_TO_WK_THS_REG(thr_mg, lsb_mg);
-
-	LOG_DBG("Threshold %d mg -> fs: %u mg -> reg = %d LSBs",
-			thr_mg, FS_RANGE_TO_MG(range), reg);
-	ret = 0;
-
-	return lis2hh12_wkup_threshold_set(ctx, reg);
-}
-#endif
-
-#ifdef CONFIG_LIS2HH12_FREEFALL
-static int lis2hh12_attr_set_ff_dur(const struct device *dev,
-					enum sensor_channel chan,
-					enum sensor_attribute attr,
-					const struct sensor_value *val)
-{
-	int rc;
-	uint16_t duration;
-	const struct lis2hh12_device_config *cfg = dev->config;
-	struct lis2hh12_data *lis2hh12 = dev->data;
-	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-
-	LOG_DBG("%s on channel %d", __func__, chan);
-
-	/* can only be set for all directions at once */
-	if (chan != SENSOR_CHAN_ACCEL_XYZ) {
-		return -EINVAL;
-	}
-
-	/**
-	 * The given duration in milliseconds with the val
-	 * parameter is converted into register specific value.
-	 */
-	duration = (lis2hh12->odr * (uint16_t)sensor_value_to_double(val)) / 1000;
-
-	LOG_DBG("Freefall: duration is %d ms", (uint16_t)sensor_value_to_double(val));
-	rc = lis2hh12_ff_dur_set(ctx, duration);
-	if (rc != 0) {
-		LOG_ERR("Failed to set freefall duration");
-		return -EIO;
-	}
-	return rc;
-}
-#endif
-
 static int lis2hh12_attr_set(const struct device *dev,
 			      enum sensor_channel chan,
 			      enum sensor_attribute attr,
 			      const struct sensor_value *val)
 {
-#if CONFIG_LIS2HH12_THRESHOLD
-	switch (attr) {
-	case SENSOR_ATTR_UPPER_THRESH:
-	case SENSOR_ATTR_LOWER_THRESH:
-		return lis2hh12_attr_set_thresh(dev, chan, attr, val);
-	default:
-		/* Do nothing */
-		break;
-	}
-#endif
-
-#ifdef CONFIG_LIS2HH12_FREEFALL
-	if (attr == SENSOR_ATTR_FF_DUR) {
-		return lis2hh12_attr_set_ff_dur(dev, chan, attr, val);
-	}
-#endif
-
 	switch (chan) {
 	case SENSOR_CHAN_ACCEL_X:
 	case SENSOR_CHAN_ACCEL_Y:
@@ -316,7 +216,6 @@ static int lis2hh12_sample_fetch(const struct device *dev,
 	struct lis2hh12_data *lis2hh12 = dev->data;
 	const struct lis2hh12_device_config *cfg = dev->config;
 	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-	uint8_t shift;
 	int16_t buf[3];
 
 	/* fetch raw data sample */
@@ -325,66 +224,19 @@ static int lis2hh12_sample_fetch(const struct device *dev,
 		return -EIO;
 	}
 
-	/* adjust to resolution */
-	if (cfg->pm == LIS2HH12_CONT_LOW_PWR_12bit) {
-		shift = LIS2HH12_SHIFT_PM1;
-	} else {
-		shift = LIS2HH12_SHIFT_PMOTHER;
-	}
-
-	lis2hh12->acc[0] = sys_le16_to_cpu(buf[0]) >> shift;
-	lis2hh12->acc[1] = sys_le16_to_cpu(buf[1]) >> shift;
-	lis2hh12->acc[2] = sys_le16_to_cpu(buf[2]) >> shift;
+	lis2hh12->acc[0] = sys_le16_to_cpu(buf[0]);
+	lis2hh12->acc[1] = sys_le16_to_cpu(buf[1]);
+	lis2hh12->acc[2] = sys_le16_to_cpu(buf[2]);
 
 	return 0;
 }
 
 static const struct sensor_driver_api lis2hh12_driver_api = {
 	.attr_set = lis2hh12_attr_set,
-#if CONFIG_LIS2HH12_TRIGGER
-	.trigger_set = lis2hh12_trigger_set,
-#endif /* CONFIG_LIS2HH12_TRIGGER */
 	.sample_fetch = lis2hh12_sample_fetch,
 	.channel_get = lis2hh12_channel_get,
 };
 
-static int lis2hh12_set_power_mode(const struct device *dev,
-				    lis2hh12_mode_t pm)
-{
-	const struct lis2hh12_device_config *cfg = dev->config;
-	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-	uint8_t regval = LIS2HH12_CONT_LOW_PWR_12bit;
-
-	switch (pm) {
-	case LIS2HH12_CONT_LOW_PWR_2:
-	case LIS2HH12_CONT_LOW_PWR_3:
-	case LIS2HH12_CONT_LOW_PWR_4:
-	case LIS2HH12_HIGH_PERFORMANCE:
-		regval = pm;
-		break;
-	default:
-		LOG_DBG("Apply default Power Mode");
-		break;
-	}
-
-	return lis2hh12_write_reg(ctx, LIS2HH12_CTRL1, &regval, 1);
-}
-
-static int lis2hh12_set_low_noise(const struct device *dev,
-				  bool low_noise)
-{
-	const struct lis2hh12_device_config *cfg = dev->config;
-	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-	lis2hh12_ctrl6_t ctrl6;
-	int ret;
-
-	ret = lis2hh12_read_reg(ctx, LIS2HH12_CTRL6, (uint8_t *)&ctrl6, 1);
-	if (ret < 0) {
-		return ret;
-	}
-	ctrl6.low_noise = low_noise;
-	return lis2hh12_write_reg(ctx, LIS2HH12_CTRL6, (uint8_t *)&ctrl6, 1);
-}
 
 static int lis2hh12_init(const struct device *dev)
 {
@@ -395,7 +247,7 @@ static int lis2hh12_init(const struct device *dev)
 	int ret;
 
 	/* check chip ID */
-	ret = lis2hh12_device_id_get(ctx, &wai);
+	ret = lis2hh12_dev_id_get(ctx, &wai);
 	if (ret < 0) {
 		LOG_ERR("Not able to read dev id");
 		return ret;
@@ -407,32 +259,48 @@ static int lis2hh12_init(const struct device *dev)
 	}
 
 	/* reset device */
-	ret = lis2hh12_reset_set(ctx, PROPERTY_ENABLE);
+	ret = lis2hh12_dev_reset_set(ctx, PROPERTY_ENABLE);
 	if (ret < 0) {
 		return ret;
 	}
 
 	k_busy_wait(100);
 
+	/* Enable Block Data Update */
 	ret = lis2hh12_block_data_update_set(ctx, PROPERTY_ENABLE);
 	if (ret < 0) {
 		LOG_ERR("Not able to set BDU");
 		return ret;
 	}
 
-	/* set power mode */
-	LOG_DBG("power-mode is %d", cfg->pm);
-	ret = lis2hh12_set_power_mode(dev, cfg->pm);
+	/* Configure filtering chain */
+    /* Accelerometer data output- filter path / bandwidth */
+    ret = lis2hh12_xl_filter_aalias_bandwidth_set(ctx, LIS2HH12_AUTO);
 	if (ret < 0) {
+		LOG_ERR("Not able to set filter_aalias_bandwidth");
 		return ret;
 	}
 
-	LOG_DBG("low noise is %d", cfg->low_noise);
-	ret = lis2hh12_set_low_noise(dev, cfg->low_noise);
+    ret = lis2hh12_xl_filter_out_path_set(ctx, LIS2HH12_FILT_LP);
 	if (ret < 0) {
-		LOG_ERR("Failed to configure low_noise");
+		LOG_ERR("Not able to set filter_out_path");
 		return ret;
 	}
+
+    ret = lis2hh12_xl_filter_low_bandwidth_set(ctx,
+                                        LIS2HH12_LP_ODR_DIV_400);
+	if (ret < 0) {
+		LOG_ERR("Not able to set filter_low_bandwidth");
+		return ret;
+	}
+
+	/* Accelerometer interrupt diosable - filter path / bandwidth */
+    ret = lis2hh12_xl_filter_int_path_set(ctx, LIS2HH12_HP_DISABLE);
+	if (ret < 0) {
+		LOG_ERR("Not able to set filter_int_path");
+		return ret;
+	}
+
 	/* set the output data rate */
 	ret = lis2hh12_set_odr(dev, cfg->odr);
 	if (ret < 0) {
@@ -443,36 +311,9 @@ static int lis2hh12_init(const struct device *dev)
 	lis2hh12->odr = cfg->odr;
 
 	LOG_DBG("range is %d", cfg->range);
-	ret = lis2hh12_set_range(dev, LIS2HH12_FS_TO_REG(cfg->range));
+	ret = lis2hh12_set_range(dev, cfg->range);
 	if (ret < 0) {
 		LOG_ERR("range init error %d", cfg->range);
-		return ret;
-	}
-
-	LOG_DBG("bandwidth filter is %u", (int)cfg->bw_filt);
-	lis2hh12_filter_bandwidth_set(ctx, cfg->bw_filt);
-
-#ifdef CONFIG_LIS2HH12_TRIGGER
-	ret = lis2hh12_init_interrupt(dev);
-	if (ret < 0) {
-		LOG_ERR("Failed to initialize interrupts");
-		return ret;
-	}
-#endif /* CONFIG_LIS2HH12_TRIGGER */
-
-	LOG_DBG("high pass reference mode is %d", (int)cfg->hp_ref_mode);
-	ret = lis2hh12_reference_mode_set(ctx, cfg->hp_ref_mode);
-	if (ret < 0) {
-		LOG_ERR("high pass reference mode config error %d", (int)cfg->hp_ref_mode);
-		return ret;
-	}
-
-	LOG_DBG("high pass filter path is %d", (int)cfg->hp_filter_path);
-	lis2hh12_fds_t fds = cfg->hp_filter_path ?
-		LIS2HH12_HIGH_PASS_ON_OUT : LIS2HH12_LPF_ON_OUT;
-	ret = lis2hh12_filter_path_set(ctx, fds);
-	if (ret < 0) {
-		LOG_ERR("filter path config error %d", (int)cfg->hp_filter_path);
 		return ret;
 	}
 
@@ -484,7 +325,7 @@ static int lis2hh12_init(const struct device *dev)
 #endif
 
 /*
- * Device creation macro, shared by LIS2HH12_DEFINE_SPI() and
+ * Device creation macro and
  * LIS2HH12_DEFINE_I2C().
  */
 
@@ -497,71 +338,6 @@ static int lis2hh12_init(const struct device *dev)
 			    POST_KERNEL,				\
 			    CONFIG_SENSOR_INIT_PRIORITY,		\
 			    &lis2hh12_driver_api);
-
-/*
- * Instantiation macros used when a device is on a SPI bus.
- */
-
-#ifdef CONFIG_LIS2HH12_TAP
-#define LIS2HH12_CONFIG_TAP(inst)					\
-	.tap_mode = DT_INST_PROP(inst, tap_mode),			\
-	.tap_threshold = DT_INST_PROP(inst, tap_threshold),		\
-	.tap_shock = DT_INST_PROP(inst, tap_shock),			\
-	.tap_latency = DT_INST_PROP(inst, tap_latency),			\
-	.tap_quiet = DT_INST_PROP(inst, tap_quiet),
-#else
-#define LIS2HH12_CONFIG_TAP(inst)
-#endif /* CONFIG_LIS2HH12_TAP */
-
-#ifdef CONFIG_LIS2HH12_FREEFALL
-#define LIS2HH12_CONFIG_FREEFALL(inst)					\
-	.freefall_duration = DT_INST_PROP(inst, ff_duration),	\
-	.freefall_threshold = DT_INST_PROP(inst, ff_threshold),
-#else
-#define LIS2HH12_CONFIG_FREEFALL(inst)
-#endif /* CONFIG_LIS2HH12_FREEFALL */
-
-#ifdef CONFIG_LIS2HH12_TRIGGER
-#define LIS2HH12_CFG_IRQ(inst) \
-	.gpio_int = GPIO_DT_SPEC_INST_GET(inst, irq_gpios),		\
-	.int_pin = DT_INST_PROP(inst, int_pin),
-#else
-#define LIS2HH12_CFG_IRQ(inst)
-#endif /* CONFIG_LIS2HH12_TRIGGER */
-
-#define LIS2HH12_SPI_OPERATION (SPI_WORD_SET(8) |			\
-				SPI_OP_MODE_MASTER |			\
-				SPI_MODE_CPOL |				\
-				SPI_MODE_CPHA)				\
-
-#define LIS2HH12_CONFIG_SPI(inst)					\
-	{								\
-		.ctx = {						\
-			.read_reg =					\
-			   (stmdev_read_ptr) stmemsc_spi_read,		\
-			.write_reg =					\
-			   (stmdev_write_ptr) stmemsc_spi_write,	\
-			.handle =					\
-			   (void *)&lis2hh12_config_##inst.stmemsc_cfg,	\
-		},							\
-		.stmemsc_cfg = {					\
-			.spi = SPI_DT_SPEC_INST_GET(inst,		\
-					   LIS2HH12_SPI_OPERATION,	\
-					   0),				\
-		},							\
-		.pm = DT_INST_PROP(inst, power_mode),			\
-		.odr = DT_INST_PROP_OR(inst, odr, 12),			\
-		.range = DT_INST_PROP(inst, range),			\
-		.bw_filt = DT_INST_PROP(inst, bw_filt),      \
-		.low_noise = DT_INST_PROP(inst, low_noise),      \
-		.hp_filter_path = DT_INST_PROP(inst, hp_filter_path),      \
-		.hp_ref_mode = DT_INST_PROP(inst, hp_ref_mode), \
-		.drdy_pulsed = DT_INST_PROP(inst, drdy_pulsed),      \
-		LIS2HH12_CONFIG_TAP(inst)				\
-		LIS2HH12_CONFIG_FREEFALL(inst)		\
-		COND_CODE_1(DT_INST_NODE_HAS_PROP(inst, irq_gpios),	\
-			(LIS2HH12_CFG_IRQ(inst)), ())			\
-	}
 
 /*
  * Instantiation macros used when a device is on an I2C bus.
@@ -580,16 +356,12 @@ static int lis2hh12_init(const struct device *dev)
 		.stmemsc_cfg = {					\
 			.i2c = I2C_DT_SPEC_INST_GET(inst),		\
 		},							\
-		.pm = DT_INST_PROP(inst, power_mode),			\
 		.odr = DT_INST_PROP_OR(inst, odr, 12),			\
 		.range = DT_INST_PROP(inst, range),			\
 		.bw_filt = DT_INST_PROP(inst, bw_filt),      \
-		.low_noise = DT_INST_PROP(inst, low_noise),      \
 		.hp_filter_path = DT_INST_PROP(inst, hp_filter_path),      \
 		.hp_ref_mode = DT_INST_PROP(inst, hp_ref_mode), \
 		.drdy_pulsed = DT_INST_PROP(inst, drdy_pulsed),      \
-		LIS2HH12_CONFIG_TAP(inst)				\
-		LIS2HH12_CONFIG_FREEFALL(inst)		\
 		COND_CODE_1(DT_INST_NODE_HAS_PROP(inst, irq_gpios),	\
 			(LIS2HH12_CFG_IRQ(inst)), ())			\
 	}
@@ -602,9 +374,7 @@ static int lis2hh12_init(const struct device *dev)
 #define LIS2HH12_DEFINE(inst)						\
 	static struct lis2hh12_data lis2hh12_data_##inst;		\
 	static const struct lis2hh12_device_config lis2hh12_config_##inst =	\
-	COND_CODE_1(DT_INST_ON_BUS(inst, spi),				\
-		    (LIS2HH12_CONFIG_SPI(inst)),			\
-		    (LIS2HH12_CONFIG_I2C(inst)));			\
+	LIS2HH12_CONFIG_I2C(inst);			\
 	LIS2HH12_DEVICE_INIT(inst)
 
 DT_INST_FOREACH_STATUS_OKAY(LIS2HH12_DEFINE)
