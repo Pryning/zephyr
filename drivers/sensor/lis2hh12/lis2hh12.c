@@ -10,85 +10,45 @@
 
 #define DT_DRV_COMPAT st_lis2hh12
 
-#include <zephyr/init.h>
-#include <stdlib.h>
-#include <zephyr/sys/__assert.h>
-#include <zephyr/sys/byteorder.h>
-#include <zephyr/logging/log.h>
 #include <zephyr/drivers/sensor.h>
-
-#if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
-#include <zephyr/drivers/i2c.h>
-#endif
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/init.h>
+#include <string.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/__assert.h>
+#include <zephyr/logging/log.h>
 
 #include "lis2hh12.h"
 
 LOG_MODULE_REGISTER(LIS2HH12, CONFIG_SENSOR_LOG_LEVEL);
 
-/**
- * lis2hh12_set_range - set full scale range for acc
- * @dev: Pointer to instance of struct device
- * @fs: Full scale range (2, 4, 8 and 16 G)
- */
-static int lis2hh12_set_range(const struct device *dev, uint8_t fs)
+static int lis2hh12_set_odr(const struct device *dev, uint8_t odr)
 {
-	int err;
-	const struct lis2hh12_device_config *cfg = dev->config;
+	const struct lis2hh12_config *cfg = dev->config;
 	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-
-	lis2hh12_xl_fs_t val;
-	switch (fs) {
-	case 2:
-		val = LIS2HH12_2g;
-		break;
-	case 4:
-		val = LIS2HH12_4g;
-		break;
-	case 8:
-		val = LIS2HH12_8g;
-		break;
-
-	default:
-		LOG_ERR("%s: bad range %d", dev->name, fs);
-		return -ENOTSUP;
-	}
-
-	err = lis2hh12_xl_full_scale_set(ctx, val);
-	return err;
-}
-
-/**
- * lis2hh12_set_odr - set new sampling frequency
- * @dev: Pointer to instance of struct device
- * @odr: Output data rate
- */
-static int lis2hh12_set_odr(const struct device *dev, uint16_t odr)
-{
-	const struct lis2hh12_device_config *cfg = dev->config;
-	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-	struct lis2hh12_data *lis2hh12 = dev->data;
 	lis2hh12_xl_data_rate_t val;
 
 	switch (odr) {
-	case 0:
+	case LIS2HH12_XL_ODR_OFF:
 		val = LIS2HH12_XL_ODR_OFF;
 		break;
-	case 10:
+	case LIS2HH12_XL_ODR_10Hz:
 		val = LIS2HH12_XL_ODR_10Hz;
 		break;
-	case 50:
+	case LIS2HH12_XL_ODR_50Hz:
 		val = LIS2HH12_XL_ODR_50Hz;
 		break;
-	case 100:
+	case LIS2HH12_XL_ODR_100Hz:
 		val = LIS2HH12_XL_ODR_100Hz;
 		break;
-	case 200:
+	case LIS2HH12_XL_ODR_200Hz:
 		val = LIS2HH12_XL_ODR_200Hz;
 		break;
-	case 400:
+	case LIS2HH12_XL_ODR_400Hz:
 		val = LIS2HH12_XL_ODR_400Hz;
 		break;
-	case 800:
+	case LIS2HH12_XL_ODR_800Hz:
 		val = LIS2HH12_XL_ODR_800Hz;
 		break;
 
@@ -97,9 +57,117 @@ static int lis2hh12_set_odr(const struct device *dev, uint16_t odr)
 		return -ENOTSUP;
 	}
 
-
-	lis2hh12->odr = odr;
 	return lis2hh12_xl_data_rate_set(ctx, val);
+}
+
+static int lis2hh12_set_range(const struct device *dev, uint8_t range)
+{
+	int err;
+	struct lis2hh12_data *data = dev->data;
+	const struct lis2hh12_config *cfg = dev->config;
+	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
+
+	switch (range) {
+	default:
+	case 2U:
+		err = lis2hh12_xl_full_scale_set(ctx, LIS2HH12_2g);
+		data->gain = lis2hh12_from_fs2g_to_mg(1);
+		break;
+	case 4U:
+		err = lis2hh12_xl_full_scale_set(ctx, LIS2HH12_4g);
+		data->gain = lis2hh12_from_fs4g_to_mg(1);
+		break;
+	case 8U:
+		err = lis2hh12_xl_full_scale_set(ctx, LIS2HH12_8g);
+		data->gain = lis2hh12_from_fs8g_to_mg(1);
+		break;
+	}
+
+	return err;
+}
+
+static int lis2hh12_accel_config(const struct device *dev,
+				 enum sensor_channel chan,
+				 enum sensor_attribute attr,
+				 const struct sensor_value *val)
+{
+	switch (attr) {
+	case SENSOR_ATTR_FULL_SCALE:
+		return lis2hh12_set_range(dev, sensor_ms2_to_g(val));
+	case SENSOR_ATTR_SAMPLING_FREQUENCY:
+		LOG_DBG("%s: set odr to %d Hz", dev->name, val->val1);
+		return lis2hh12_set_odr(dev, LIS2HH12_ODR_TO_REG(val->val1));
+	default:
+		LOG_DBG("Accel attribute not supported.");
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+
+static int lis2hh12_attr_set(const struct device *dev,
+			     enum sensor_channel chan,
+			     enum sensor_attribute attr,
+			     const struct sensor_value *val)
+{
+	switch (chan) {
+	case SENSOR_CHAN_ACCEL_XYZ:
+		return lis2hh12_accel_config(dev, chan, attr, val);
+	default:
+		LOG_WRN("attr_set() not supported on this channel.");
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+
+static int lis2hh12_sample_fetch_accel(const struct device *dev)
+{
+	struct lis2hh12_data *data = dev->data;
+	const struct lis2hh12_config *cfg = dev->config;
+	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
+	int16_t buf[3];
+
+	/* fetch raw data sample */
+	if (lis2hh12_acceleration_raw_get(ctx, buf) < 0) {
+		LOG_ERR("Failed to fetch raw data sample");
+		return -EIO;
+	}
+
+	data->sample_x = sys_le16_to_cpu(buf[0]);
+	data->sample_y = sys_le16_to_cpu(buf[1]);
+	data->sample_z = sys_le16_to_cpu(buf[2]);
+
+	return 0;
+}
+
+static int lis2hh12_sample_fetch(const struct device *dev,
+				 enum sensor_channel chan)
+{
+	switch (chan) {
+	case SENSOR_CHAN_ACCEL_XYZ:
+		lis2hh12_sample_fetch_accel(dev);
+		break;
+#if defined(CONFIG_LIS2HH12_ENABLE_TEMP)
+	case SENSOR_CHAN_DIE_TEMP:
+		/* ToDo:
+		lis2hh12_sample_fetch_temp(dev)
+		*/
+		break;
+#endif
+	case SENSOR_CHAN_ALL:
+		lis2hh12_sample_fetch_accel(dev);
+#if defined(CONFIG_LIS2HH12_ENABLE_TEMP)
+		/* ToDo:
+		lis2hh12_sample_fetch_temp(dev)
+		*/
+#endif
+		break;
+	default:
+		return -ENOTSUP;
+	}
+
+	return 0;
 }
 
 static inline void lis2hh12_convert(struct sensor_value *val, int raw_val,
@@ -107,154 +175,74 @@ static inline void lis2hh12_convert(struct sensor_value *val, int raw_val,
 {
 	int64_t dval;
 
-	/* Gain is in ug/LSB */
+	/* Gain is in mg/LSB */
 	/* Convert to m/s^2 */
-	dval = ((int64_t)raw_val * gain * SENSOR_G) / 1000000LL;
+	dval = ((int64_t)raw_val * gain * SENSOR_G) / 1000;
 	val->val1 = dval / 1000000LL;
 	val->val2 = dval % 1000000LL;
 }
 
-static inline void lis2hh12_channel_get_acc(const struct device *dev,
-					     enum sensor_channel chan,
-					     struct sensor_value *val)
-{
-	int i;
-	uint8_t ofs_start, ofs_stop;
-	struct lis2hh12_data *lis2hh12 = dev->data;
-	struct sensor_value *pval = val;
-
-	switch (chan) {
-	case SENSOR_CHAN_ACCEL_X:
-		ofs_start = ofs_stop = 0U;
-		break;
-	case SENSOR_CHAN_ACCEL_Y:
-		ofs_start = ofs_stop = 1U;
-		break;
-	case SENSOR_CHAN_ACCEL_Z:
-		ofs_start = ofs_stop = 2U;
-		break;
-	default:
-		ofs_start = 0U; ofs_stop = 2U;
-		break;
-	}
-
-	for (i = ofs_start; i <= ofs_stop ; i++) {
-		lis2hh12_convert(pval++, lis2hh12->acc[i], lis2hh12->gain);
-	}
-}
-
-static int lis2hh12_channel_get(const struct device *dev,
-				 enum sensor_channel chan,
-				 struct sensor_value *val)
+static inline int lis2hh12_get_channel(enum sensor_channel chan,
+					     struct sensor_value *val,
+					     struct lis2hh12_data *data,
+					     float gain)
 {
 	switch (chan) {
 	case SENSOR_CHAN_ACCEL_X:
+		lis2hh12_convert(val, data->sample_x, gain);
+		break;
 	case SENSOR_CHAN_ACCEL_Y:
+		lis2hh12_convert(val, data->sample_y, gain);
+		break;
 	case SENSOR_CHAN_ACCEL_Z:
+		lis2hh12_convert(val, data->sample_z, gain);
+		break;
 	case SENSOR_CHAN_ACCEL_XYZ:
-		lis2hh12_channel_get_acc(dev, chan, val);
-		return 0;
-	default:
-		LOG_DBG("Channel not supported");
+		lis2hh12_convert(val, data->sample_x, gain);
+		lis2hh12_convert(val + 1, data->sample_y, gain);
+		lis2hh12_convert(val + 2, data->sample_z, gain);
 		break;
-	}
-
-	return -ENOTSUP;
-}
-
-static int lis2hh12_config(const struct device *dev, enum sensor_channel chan,
-			    enum sensor_attribute attr,
-			    const struct sensor_value *val)
-{
-	switch (attr) {
-	case SENSOR_ATTR_FULL_SCALE:
-		return lis2hh12_set_range(dev,sensor_ms2_to_g(val));
-	case SENSOR_ATTR_SAMPLING_FREQUENCY:
-		return lis2hh12_set_odr(dev, val->val1);
 	default:
-		LOG_DBG("Acc attribute not supported");
-		break;
+		return -ENOTSUP;
 	}
-
-	return -ENOTSUP;
-}
-
-
-static inline int32_t sensor_ms2_to_mg(const struct sensor_value *ms2)
-{
-	int64_t nano_ms2 = (ms2->val1 * 1000000LL + ms2->val2) * 1000LL;
-
-	if (nano_ms2 > 0) {
-		return (nano_ms2 + SENSOR_G / 2) / SENSOR_G;
-	} else {
-		return (nano_ms2 - SENSOR_G / 2) / SENSOR_G;
-	}
-}
-
-static int lis2hh12_attr_set(const struct device *dev,
-			      enum sensor_channel chan,
-			      enum sensor_attribute attr,
-			      const struct sensor_value *val)
-{
-	switch (chan) {
-	case SENSOR_CHAN_ACCEL_X:
-	case SENSOR_CHAN_ACCEL_Y:
-	case SENSOR_CHAN_ACCEL_Z:
-	case SENSOR_CHAN_ACCEL_XYZ:
-		return lis2hh12_config(dev, chan, attr, val);
-	default:
-		LOG_DBG("Attr not supported on %d channel", chan);
-		break;
-	}
-
-	return -ENOTSUP;
-}
-
-static int lis2hh12_sample_fetch(const struct device *dev,
-				 enum sensor_channel chan)
-{
-	struct lis2hh12_data *lis2hh12 = dev->data;
-	const struct lis2hh12_device_config *cfg = dev->config;
-	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-	int16_t buf[3];
-
-	/* fetch raw data sample */
-	if (lis2hh12_acceleration_raw_get(ctx, buf) < 0) {
-		LOG_DBG("Failed to fetch raw data sample");
-		return -EIO;
-	}
-
-	lis2hh12->acc[0] = sys_le16_to_cpu(buf[0]);
-	lis2hh12->acc[1] = sys_le16_to_cpu(buf[1]);
-	lis2hh12->acc[2] = sys_le16_to_cpu(buf[2]);
 
 	return 0;
 }
 
+static int lis2hh12_channel_get(const struct device *dev,
+				enum sensor_channel chan,
+				struct sensor_value *val)
+{
+	struct lis2hh12_data *data = dev->data;
+
+	return lis2hh12_get_channel(chan, val, data, data->gain);
+}
+
 static const struct sensor_driver_api lis2hh12_driver_api = {
 	.attr_set = lis2hh12_attr_set,
+#if defined(CONFIG_LIS2HH12_TRIGGER)
+	.trigger_set = lis2hh12_trigger_set,
+#endif
 	.sample_fetch = lis2hh12_sample_fetch,
 	.channel_get = lis2hh12_channel_get,
 };
 
-
 static int lis2hh12_init(const struct device *dev)
 {
-	const struct lis2hh12_device_config *cfg = dev->config;
-	struct lis2hh12_data *lis2hh12 = dev->data;
+	const struct lis2hh12_config * const cfg = dev->config;
 	stmdev_ctx_t *ctx = (stmdev_ctx_t *)&cfg->ctx;
-	uint8_t wai;
+	uint8_t chip_id;
 	int ret;
 
 	/* check chip ID */
-	ret = lis2hh12_dev_id_get(ctx, &wai);
+	ret = lis2hh12_dev_id_get(ctx, &chip_id);
 	if (ret < 0) {
-		LOG_ERR("Not able to read dev id");
+		LOG_ERR("%s: Not able to read dev id", dev->name);
 		return ret;
 	}
 
-	if (wai != LIS2HH12_ID) {
-		LOG_ERR("Invalid chip ID");
+	if (chip_id != LIS2HH12_ID) {
+		LOG_ERR("%s: Invalid chip ID 0x%02x", dev->name, chip_id);
 		return -EINVAL;
 	}
 
@@ -265,6 +253,16 @@ static int lis2hh12_init(const struct device *dev)
 	}
 
 	k_busy_wait(100);
+
+	LOG_DBG("%s: chip id 0x%x", dev->name, chip_id);
+
+#ifdef CONFIG_LIS2HH12_TRIGGER
+	ret = lis2hh12_trigger_init(dev);
+	if (ret < 0) {
+		LOG_ERR("%s: Failed to initialize triggers", dev->name);
+		return ret;
+	}
+#endif
 
 	/* Enable Block Data Update */
 	ret = lis2hh12_block_data_update_set(ctx, PROPERTY_ENABLE);
@@ -287,8 +285,7 @@ static int lis2hh12_init(const struct device *dev)
 		return ret;
 	}
 
-    ret = lis2hh12_xl_filter_low_bandwidth_set(ctx,
-                                        LIS2HH12_LP_ODR_DIV_400);
+    ret = lis2hh12_xl_filter_low_bandwidth_set(ctx, LIS2HH12_LP_ODR_DIV_400);
 	if (ret < 0) {
 		LOG_ERR("Not able to set filter_low_bandwidth");
 		return ret;
@@ -301,19 +298,19 @@ static int lis2hh12_init(const struct device *dev)
 		return ret;
 	}
 
-	/* set the output data rate */
+	/* set sensor default odr */
+	LOG_DBG("%s: odr: %d", dev->name, cfg->odr);
 	ret = lis2hh12_set_odr(dev, cfg->odr);
 	if (ret < 0) {
-		LOG_ERR("odr init error %d", cfg->odr);
+		LOG_ERR("%s: odr init error %d", dev->name, cfg->odr);
 		return ret;
 	}
 
-	lis2hh12->odr = cfg->odr;
-
-	LOG_DBG("range is %d", cfg->range);
+	/* set sensor default scale */
+	LOG_DBG("%s: range is %d", dev->name, cfg->range);
 	ret = lis2hh12_set_range(dev, cfg->range);
 	if (ret < 0) {
-		LOG_ERR("range init error %d", cfg->range);
+		LOG_ERR("%s: range init error %d", dev->name, cfg->range);
 		return ret;
 	}
 
@@ -325,7 +322,7 @@ static int lis2hh12_init(const struct device *dev)
 #endif
 
 /*
- * Device creation macro and
+ * Device creation macro, shared by LIS2HH12_DEFINE_SPI() and
  * LIS2HH12_DEFINE_I2C().
  */
 
@@ -338,6 +335,43 @@ static int lis2hh12_init(const struct device *dev)
 			    POST_KERNEL,				\
 			    CONFIG_SENSOR_INIT_PRIORITY,		\
 			    &lis2hh12_driver_api);
+
+/*
+ * Instantiation macros used when a device is on a SPI bus.
+ */
+
+#ifdef CONFIG_LIS2HH12_TRIGGER
+#define LIS2HH12_CFG_IRQ(inst) \
+	.gpio_int = GPIO_DT_SPEC_INST_GET(inst, irq_gpios),
+#else
+#define LIS2HH12_CFG_IRQ(inst)
+#endif /* CONFIG_LIS2HH12_TRIGGER */
+
+#define LIS2HH12_SPI_OPERATION (SPI_WORD_SET(8) |			\
+				SPI_OP_MODE_MASTER |			\
+				SPI_MODE_CPOL |				\
+				SPI_MODE_CPHA)				\
+
+#define LIS2HH12_CONFIG_SPI(inst)					\
+	{								\
+		.ctx = {						\
+			.read_reg =					\
+			   (stmdev_read_ptr) stmemsc_spi_read,		\
+			.write_reg =					\
+			   (stmdev_write_ptr) stmemsc_spi_write,	\
+			.handle =					\
+			   (void *)&lis2hh12_config_##inst.stmemsc_cfg,	\
+		},							\
+		.stmemsc_cfg = {					\
+			.spi = SPI_DT_SPEC_INST_GET(inst,		\
+					   LIS2HH12_SPI_OPERATION,	\
+					   0),				\
+		},							\
+		.range = DT_INST_PROP(inst, range),			\
+		.odr = DT_INST_PROP(inst, odr),				\
+		COND_CODE_1(DT_INST_NODE_HAS_PROP(inst, irq_gpios),	\
+			(LIS2HH12_CFG_IRQ(inst)), ())			\
+	}
 
 /*
  * Instantiation macros used when a device is on an I2C bus.
@@ -356,12 +390,8 @@ static int lis2hh12_init(const struct device *dev)
 		.stmemsc_cfg = {					\
 			.i2c = I2C_DT_SPEC_INST_GET(inst),		\
 		},							\
-		.odr = DT_INST_PROP_OR(inst, odr, 12),			\
 		.range = DT_INST_PROP(inst, range),			\
-		.bw_filt = DT_INST_PROP(inst, bw_filt),      \
-		.hp_filter_path = DT_INST_PROP(inst, hp_filter_path),      \
-		.hp_ref_mode = DT_INST_PROP(inst, hp_ref_mode), \
-		.drdy_pulsed = DT_INST_PROP(inst, drdy_pulsed),      \
+		.odr = DT_INST_PROP(inst, odr),				\
 		COND_CODE_1(DT_INST_NODE_HAS_PROP(inst, irq_gpios),	\
 			(LIS2HH12_CFG_IRQ(inst)), ())			\
 	}
@@ -373,8 +403,10 @@ static int lis2hh12_init(const struct device *dev)
 
 #define LIS2HH12_DEFINE(inst)						\
 	static struct lis2hh12_data lis2hh12_data_##inst;		\
-	static const struct lis2hh12_device_config lis2hh12_config_##inst =	\
-	LIS2HH12_CONFIG_I2C(inst);			\
+	static const struct lis2hh12_config lis2hh12_config_##inst =	\
+	COND_CODE_1(DT_INST_ON_BUS(inst, spi),				\
+		    (LIS2HH12_CONFIG_SPI(inst)),			\
+		    (LIS2HH12_CONFIG_I2C(inst)));			\
 	LIS2HH12_DEVICE_INIT(inst)
 
 DT_INST_FOREACH_STATUS_OKAY(LIS2HH12_DEFINE)

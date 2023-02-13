@@ -39,8 +39,6 @@ endchoice
 config LIS2HH12_TRIGGER
 	bool
 
-if LIS2HH12_TRIGGER
-
 config LIS2HH12_THREAD_PRIORITY
 	int "Thread priority"
 	depends on LIS2HH12_TRIGGER_OWN_THREAD
@@ -55,26 +53,9 @@ config LIS2HH12_THREAD_STACK_SIZE
 	help
 	  Stack size of thread used by the driver to handle interrupts.
 
-config LIS2HH12_TAP
-	bool "Tap and Tap-Tap detection"
+config LIS2HH12_ENABLE_TEMP
+	bool "Temperature"
 	help
-	  Enable tap (single/double) detection
+	  Enable/disable temperature
 
-endif # LIS2HH12_TRIGGER
-
-config LIS2HH12_THRESHOLD
-	bool "Wakeup threshold trigger (via interrupt)"
-	help
-	  Enable the wakeup threshold trigger feature.
-	  The wake-up interrupt signal is generated if a certain number of
-	  consecutive data exceed the configured threshold (config in DT).
-	  The threshold is applied to both positive and negative data: for
-	  a wake-up interrupt generation at least one of the three axes must
-	  be bigger than the threshold. See ST AN5038 for more details about
-	  the feature.
-
-config LIS2HH12_FREEFALL
-	bool "Free Fall detection (via interrupt)"
-	help
-	  Enable freefall detection via interrupt.
 endif # LIS2HH12
